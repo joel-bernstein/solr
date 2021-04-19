@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.TimeoutException;
 
+import com.codahale.metrics.Timer;
 import org.apache.solr.client.solrj.io.Tuple;
 import org.apache.solr.client.solrj.io.comp.ComparatorOrder;
 import org.apache.solr.client.solrj.io.comp.FieldComparator;
@@ -58,6 +59,7 @@ public class ExportWriterStream extends TupleStream implements Expressible {
   int index = -1;
   ExportBuffers exportBuffers;
   ExportBuffers.Buffer buffer;
+  Timer.Context writeOutputTimerContext;
 
   private static final class TupleEntryWriter implements EntryWriter {
     Tuple tuple;
@@ -66,11 +68,11 @@ public class ExportWriterStream extends TupleStream implements Expressible {
     public EntryWriter put(CharSequence k, Object v) throws IOException {
       if (v instanceof IteratorWriter) {
         List<Object> lst = new ArrayList<>();
-        ((IteratorWriter)v).toList(lst);
+        ((IteratorWriter) v).toList(lst);
         v = lst;
       } else if (v instanceof MapWriter) {
         Map<String, Object> map = new HashMap<>();
-        ((MapWriter)v).toMap(map);
+        ((MapWriter) v).toMap(map);
         v = map;
       }
       tuple.put(k.toString(), v);
@@ -137,81 +139,96 @@ public class ExportWriterStream extends TupleStream implements Expressible {
   @Override
   public Tuple read() throws IOException {
     Tuple res = null;
-    if (pos < 0) {
-
-      try {
-        buffer.outDocsIndex = ExportBuffers.Buffer.EMPTY;
-        //log.debug("--- ews exchange empty buffer {}", buffer);
-        boolean exchanged = false;
-        while (!exchanged) {
-          try {
-            long startExchangeBuffers = System.nanoTime();
-            exportBuffers.exchangeBuffers();
-            long endExchangeBuffers = System.nanoTime();
-            if(log.isDebugEnabled()) {
-              log.debug("Waited for reader thread:{}",  Long.toString(((endExchangeBuffers - startExchangeBuffers) / 1000000)));
-            }
-            exchanged = true;
-          } catch (TimeoutException e) {
-            log.debug("--- ews timeout loop");
-            if (exportBuffers.isShutDown()) {
-              log.debug("--- ews - the other end is shutdown, returning EOF");
-              res = Tuple.EOF();
-              break;
-            }
-            continue;
-          } catch (InterruptedException e) {
-            log.debug("--- ews interrupted");
-            exportBuffers.error(e);
-            res = Tuple.EXCEPTION(e, true);
-            break;
-          } catch (BrokenBarrierException e) {
-            if (exportBuffers.getError() != null) {
-              res = Tuple.EXCEPTION(exportBuffers.getError(), true);
-            } else {
-              res = Tuple.EXCEPTION(e, true);
-            }
-            break;
-          } finally {
-          }
+    do {
+      if (pos < 0) {
+        if (writeOutputTimerContext != null) {
+          writeOutputTimerContext.stop();
+          writeOutputTimerContext = null;
         }
-      } catch (InterruptedException e) {
-        log.debug("--- ews interrupt");
-        exportBuffers.error(e);
-        res = Tuple.EXCEPTION(e, true);
-      } catch (Exception e) {
-        log.debug("--- ews exception", e);
-        exportBuffers.error(e);
-        res = Tuple.EXCEPTION(e, true);
+        try {
+          buffer.outDocsIndex = ExportBuffers.Buffer.EMPTY;
+          //log.debug("--- ews exchange empty buffer {}", buffer);
+          boolean exchanged = false;
+          while (!exchanged) {
+            Timer.Context timerCtx = exportBuffers.getWriterWaitTimer().time();
+            try {
+              long startExchangeBuffers = System.nanoTime();
+              exportBuffers.exchangeBuffers();
+              long endExchangeBuffers = System.nanoTime();
+              if(log.isDebugEnabled()) {
+                log.debug("Waited for reader thread:{}",  Long.toString(((endExchangeBuffers - startExchangeBuffers) / 1000000)));
+              }
+              exchanged = true;
+            } catch (TimeoutException e) {
+              log.debug("--- ews timeout loop");
+              if (exportBuffers.isShutDown()) {
+                log.debug("--- ews - the other end is shutdown, returning EOF");
+                res = Tuple.EOF();
+                break;
+              }
+              continue;
+            } catch (InterruptedException e) {
+              log.debug("--- ews interrupted");
+              exportBuffers.error(e);
+              res = Tuple.EXCEPTION(e, true);
+              break;
+            } catch (BrokenBarrierException e) {
+              if (exportBuffers.getError() != null) {
+                res = Tuple.EXCEPTION(exportBuffers.getError(), true);
+              } else {
+                res = Tuple.EXCEPTION(e, true);
+              }
+              break;
+            } finally {
+              timerCtx.stop();
+            }
+          }
+        } catch (InterruptedException e) {
+          log.debug("--- ews interrupt");
+          exportBuffers.error(e);
+          res = Tuple.EXCEPTION(e, true);
+        } catch (Exception e) {
+          log.debug("--- ews exception", e);
+          exportBuffers.error(e);
+          res = Tuple.EXCEPTION(e, true);
+        }
+        buffer = exportBuffers.getOutputBuffer();
+        if (buffer == null) {
+          res = Tuple.EOF();
+        }
+        if (buffer.outDocsIndex == ExportBuffers.Buffer.NO_MORE_DOCS) {
+          log.debug("--- ews EOF");
+          res = Tuple.EOF();
+        } else {
+          pos = buffer.outDocsIndex;
+          index = -1;  //restart index.
+          log.debug("--- ews new pos={}", pos);
+        }
       }
-      buffer = exportBuffers.getOutputBuffer();
-      if (buffer == null) {
+      if (pos < 0) {
+        log.debug("--- ews EOF?");
         res = Tuple.EOF();
       }
-      if (buffer.outDocsIndex == ExportBuffers.Buffer.NO_MORE_DOCS) {
-        log.debug("--- ews EOF");
-        res = Tuple.EOF();
-      } else {
-        pos = buffer.outDocsIndex;
-        index = -1;  //restart index.
-        log.debug("--- ews new pos={}", pos);
+      if (res != null) {
+        // only errors or EOF assigned result so far
+        if (writeOutputTimerContext != null) {
+          writeOutputTimerContext.stop();
+        }
+        return res;
       }
-    }
-    if (pos < 0) {
-      log.debug("--- ews EOF?");
-      res = Tuple.EOF();
-    }
-    if (res != null) {
-      // only errors or EOF assigned result so far
-
-      return res;
-    }
-
-    SortDoc sortDoc = buffer.outDocs[++index];
-    tupleEntryWriter.tuple = new Tuple();
-    exportBuffers.exportWriter.writeDoc(sortDoc, exportBuffers.leaves, tupleEntryWriter, exportBuffers.exportWriter.fieldWriters);
-    pos--;
-    return tupleEntryWriter.tuple;
+      if (writeOutputTimerContext == null) {
+        writeOutputTimerContext = exportBuffers.getWriteOutputBufferTimer().time();
+      }
+      SortDoc sortDoc = buffer.outDocs[++index];
+      MapWriter outputDoc = exportBuffers.exportWriter.fillOutputDoc(sortDoc, exportBuffers.leaves, exportBuffers.exportWriter.fieldWriters);
+      pos--;
+      if (outputDoc != null) {
+        tupleEntryWriter.tuple = new Tuple();
+        outputDoc.writeMap(tupleEntryWriter);
+        return tupleEntryWriter.tuple;
+      }
+    } while (res == null);
+    return res;
   }
 
   @Override

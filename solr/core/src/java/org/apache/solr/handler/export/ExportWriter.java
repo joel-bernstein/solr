@@ -24,9 +24,12 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.lang.invoke.MethodHandles;
 import java.nio.charset.StandardCharsets;
-import java.util.List;
-import java.util.TreeSet;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
+import com.codahale.metrics.Counter;
+import com.codahale.metrics.Timer;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedDocValues;
@@ -37,6 +40,7 @@ import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.solr.client.solrj.impl.BinaryResponseParser;
 import org.apache.solr.client.solrj.io.Tuple;
+import org.apache.solr.client.solrj.io.stream.ParallelStream;
 import org.apache.solr.client.solrj.io.stream.StreamContext;
 import org.apache.solr.client.solrj.io.stream.TupleStream;
 import org.apache.solr.client.solrj.io.stream.expr.StreamExpression;
@@ -52,7 +56,10 @@ import org.apache.solr.common.params.CommonParams;
 import org.apache.solr.common.params.SolrParams;
 import org.apache.solr.common.params.StreamParams;
 import org.apache.solr.common.util.JavaBinCodec;
+import org.apache.solr.common.util.StrUtils;
 import org.apache.solr.core.SolrCore;
+import org.apache.solr.metrics.MetricsMap;
+import org.apache.solr.metrics.SolrMetricManager;
 import org.apache.solr.metrics.SolrMetricsContext;
 import org.apache.solr.request.SolrQueryRequest;
 import org.apache.solr.request.SolrRequestInfo;
@@ -71,9 +78,8 @@ import org.apache.solr.schema.LongValueFieldType;
 import org.apache.solr.schema.SchemaField;
 import org.apache.solr.schema.SortableTextField;
 import org.apache.solr.schema.StrField;
-import org.apache.solr.search.SolrIndexSearcher;
-import org.apache.solr.search.SortSpec;
-import org.apache.solr.search.SyntaxError;
+import org.apache.solr.search.*;
+import org.apache.solr.util.RefCounted;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -97,6 +103,8 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
   public static final String BATCH_SIZE_PARAM = "batchSize";
   public static final String QUEUE_SIZE_PARAM = "queueSize";
 
+  public static final String SOLR_CACHE_KEY = "exportCache";
+
   public static final int DEFAULT_BATCH_SIZE = 30000;
   public static final int DEFAULT_QUEUE_SIZE = 150000;
 
@@ -109,6 +117,21 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
   final String metricsPath;
   //The batch size for the output writer thread.
   final int batchSize;
+  final private String wt;
+  final int numWorkers;
+  final int workerId;
+  final String fieldList;
+  final List<String> partitionKeys;
+  final String partitionCacheKey;
+
+  final Timer writeOutputBufferTimer;
+  final Timer fillOutputBufferTimer;
+  final Timer fillerWaitTimer;
+  final Timer writerWaitTimer;
+  final Timer segmentTopDocsTimer;
+  final Counter noCacheCounter;
+  final Counter useHashQueryCounter;
+
   //The max combined size of the segment level priority queues.
   private int priorityQueueSize;
   StreamExpression streamExpression;
@@ -117,13 +140,22 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
   int totalHits = 0;
   FixedBitSet[] sets = null;
   PushWriter writer;
-  private String wt;
+
+  // per-segment caches for already populated partitioning filters when parallel() is in use
+  final SolrCache<IndexReader.CacheKey, SolrCache<String, FixedBitSet>> partitionCaches;
+
+  // local per-segment partitioning filters that are incomplete (still being updated from the current request)
+  final Map<IndexReader.CacheKey, FixedBitSet> tempPartitionCaches;
+  // local copy of already cached partitioning filters
+  // (for efficiency, to use int indexes instead of cache lookups)
+  final FixedBitSet[] myPartitionSets;
 
 
 
+  @SuppressWarnings("unchecked")
   public ExportWriter(SolrQueryRequest req, SolrQueryResponse res, String wt,
                       StreamContext initialStreamContext, SolrMetricsContext solrMetricsContext,
-                      String metricsPath) {
+                      String metricsPath) throws Exception {
     this.req = req;
     this.res = res;
     this.wt = wt;
@@ -131,14 +163,102 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
     this.solrMetricsContext = solrMetricsContext;
     this.metricsPath = metricsPath;
     this.priorityQueueSize = req.getParams().getInt(QUEUE_SIZE_PARAM, DEFAULT_QUEUE_SIZE);
+    this.numWorkers = req.getParams().getInt(ParallelStream.NUM_WORKERS_PARAM, 1);
+    this.workerId = req.getParams().getInt(ParallelStream.WORKER_ID_PARAM, 0);
+    final boolean useHashQuery = req.getParams().getBool(ParallelStream.USE_HASH_QUERY_PARAM, false);
+    if (numWorkers > 1 && !useHashQuery) {
+      String keysList = req.getParams().get(ParallelStream.PARTITION_KEYS_PARAM);
+      if (keysList == null || keysList.trim().equals("none")) {
+        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "when numWorkers > 1 partitionKeys MUST be specified!");
+      }
+      partitionKeys = StrUtils.splitSmart(keysList, ',', true);
+      // we have to use ALL parameters as a cache key to account for different queries
+      partitionCacheKey = req.getParamString();
+      tempPartitionCaches = new ConcurrentHashMap<>();
+    } else {
+      partitionKeys = null;
+      partitionCacheKey = null;
+      tempPartitionCaches = null;
+    }
+    this.fieldList = req.getParams().get(CommonParams.FL);
     this.batchSize = DEFAULT_BATCH_SIZE;
+    final boolean noCache = req.getParams().getBool(ParallelStream.NO_CACHE_PARAM, false);
+    if (noCache) {
+      this.partitionCaches = null;
+    } else {
+      this.partitionCaches = (SolrCache<IndexReader.CacheKey, SolrCache<String, FixedBitSet>>) req.getSearcher().getCache(SOLR_CACHE_KEY);
+    }
+    // we are running the partitioning filter - prepare local copy of the existing
+    // cached filters
+    if (partitionCaches != null && partitionCacheKey != null) {
+      myPartitionSets = prepareMyPartitionSets(req.getSearcher().getRawReader().leaves());
+    } else {
+      myPartitionSets = null;
+    }
+
+    // initialize metrics
+    this.writeOutputBufferTimer = solrMetricsContext.timer("writeOutputBuffer", metricsPath);
+    this.writerWaitTimer = solrMetricsContext.timer("writerWait", metricsPath);
+    this.fillOutputBufferTimer = solrMetricsContext.timer("fillOutputBuffer", metricsPath);
+    this.fillerWaitTimer = solrMetricsContext.timer("fillerWait", metricsPath);
+    this.segmentTopDocsTimer = solrMetricsContext.timer("segmentTopDocs", metricsPath);
+    this.noCacheCounter = solrMetricsContext.counter("noCache", metricsPath);
+    if (noCache) {
+      noCacheCounter.inc();
+    }
+    this.useHashQueryCounter = solrMetricsContext.counter("useHashQuery", metricsPath);
+    if (useHashQuery) {
+      useHashQueryCounter.inc();
+    }
+    final SolrCore core = req.getCore();
+    MetricsMap cacheMetrics = new MetricsMap(map -> {
+      // don't use per-instance var here - always check this from the current searcher!
+      // 'req' may no longer be valid when this metric is checked, and referencing
+      // it here could lead to memory leaks
+      SolrCache<IndexReader.CacheKey, SolrCache<String, FixedBitSet>> caches;
+      // always get the latest searcher
+      RefCounted<SolrIndexSearcher> searcherRef = core.getSearcher();
+      SolrIndexSearcher searcher = searcherRef.get();
+      try {
+        if (searcher != null) {
+          caches = searcher.getCache(SOLR_CACHE_KEY);
+        } else {
+          caches = null;
+        }
+      } finally {
+        if (searcher != null) {
+          searcherRef.decref();
+        }
+      }
+      map.put("configured", caches != null);
+      if (caches != null) {
+        map.put("numSegments", caches.size());
+        if (caches instanceof CaffeineCache) {
+          CaffeineCache <IndexReader.CacheKey, SolrCache<String, FixedBitSet>> exportCache = (CaffeineCache<IndexReader.CacheKey, SolrCache<String, FixedBitSet>>) caches;
+          final int[] avgSets = new int[1];
+          if (exportCache.size() > 0) {
+            exportCache.asMap().forEach((key, setsCache) -> {
+              avgSets[0] += setsCache.size();
+            });
+            avgSets[0] = avgSets[0] / exportCache.size();
+          } else {
+            avgSets[0] = 0;
+          }
+          map.put("avgSetsPerSeg", avgSets[0]);
+        }
+      }
+    });
+    // if it already exists then it's been already registered for this core
+    solrMetricsContext.gauge(cacheMetrics, SolrMetricManager.ResolutionStrategy.IGNORE, "partitionCaches", metricsPath);
   }
 
   @Override
   public String getContentType() {
     if ("javabin".equals(wt)) {
       return BinaryResponseParser.BINARY_CONTENT_TYPE;
-    } else return "json";
+    } else {
+      return "json";
+    }
   }
 
   @Override
@@ -235,17 +355,19 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
         writeException((new IOException(new SyntaxError("xport RankQuery is required for xsort: rq={!xport}"))), writer, true);
         return;
       }
+      if (partitionCacheKey != null && partitionCaches != null) {
+        totalHits = intersectWithCachedPartitions(sets, req.getSearcher().getTopReaderContext().leaves());
+      }
     }
     SolrParams params = req.getParams();
-    String fl = params.get("fl");
 
     String[] fields = null;
 
-    if (fl == null) {
+    if (fieldList == null) {
       writeException((new IOException(new SyntaxError("export field list (fl) must be specified."))), writer, true);
       return;
     } else {
-      fields = fl.split(",");
+      fields = fieldList.split(",");
 
       for (int i = 0; i < fields.length; i++) {
 
@@ -264,6 +386,8 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
       writeException(e, writer, true);
       return;
     }
+
+    outputDoc = new OutputDocMapWriter(fields, partitionKeys);
 
     String expr = params.get(StreamParams.EXPR);
     if (expr != null) {
@@ -312,6 +436,22 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
     }
   }
 
+  // re-calculate expected totalHits using cached partitioning sets
+  // AND intersect the original sets with any existing cached per-segment sets.
+  // This way we can avoid iterating over results that we already know don't belong to the
+  // previously-calculated segment's partition
+  private int intersectWithCachedPartitions(FixedBitSet[] originalSets, List<LeafReaderContext> leaves) {
+    int newTotalHits = 0;
+    for (int i = 0; i < leaves.size(); i++) {
+      FixedBitSet partitionSet = getMyPartitionSet(leaves.get(i));
+      if (partitionSet != null) {
+        originalSets[i].and(partitionSet);
+      }
+      newTotalHits += originalSets[i].cardinality();
+    }
+    return newTotalHits;
+  }
+
   private TupleStream createTupleStream() throws IOException {
     StreamFactory streamFactory = (StreamFactory)initialStreamContext.getStreamFactory().clone();
     //Set the sort in the stream factory so it can be used during initialization.
@@ -321,34 +461,12 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
     return tupleStream;
   }
 
-  private void transferBatchToBufferForOutput(MergeIterator mergeIterator,
-                                              ExportBuffers.Buffer destination) throws IOException {
-    try {
-      int outDocsIndex = -1;
-      for (int i = 0; i < batchSize; i++) {
-        SortDoc sortDoc = mergeIterator.next();
-        if (sortDoc != null) {
-          destination.outDocs[++outDocsIndex].setValues(sortDoc);
-        } else {
-          break;
-        }
-      }
-      destination.outDocsIndex = outDocsIndex;
-    } catch (Throwable t) {
-      log.error("transfer", t);
-      if (t instanceof InterruptedException) {
-        Thread.currentThread().interrupt();
-      }
-      throw t;
-    } finally {
-
-    }
-  }
-
   protected void writeDocs(SolrQueryRequest req, OutputStream os, IteratorWriter.ItemWriter writer, Sort sort) throws IOException {
     List<LeafReaderContext> leaves = req.getSearcher().getTopReaderContext().leaves();
     final int queueSize = Math.min(batchSize, totalHits);
-
+    if (tempPartitionCaches != null && partitionCaches != null) {
+      initTempPartitionCaches(leaves);
+    }
 
     ExportBuffers buffers = new ExportBuffers(this,
                                               leaves,
@@ -358,7 +476,10 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
                                               sort,
                                               queueSize,
                                               totalHits,
-                                              sets);
+                                              sets,
+                                              fillerWaitTimer,
+                                              writeOutputBufferTimer,
+                                              writerWaitTimer);
 
 
     if (streamExpression != null) {
@@ -411,17 +532,23 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
             log.debug("--- writer interrupted");
             break;
           }
+          Timer.Context timerCtx = writeOutputBufferTimer.time();
           try {
             for (int i = 0; i <= buffer.outDocsIndex; ++i) {
               // we're using the raw writer here because there's no potential
               // reduction in the number of output items, unlike when using
               // streaming expressions
               final SortDoc currentDoc = buffer.outDocs[i];
-              writer.add((MapWriter) ew -> writeDoc(currentDoc, leaves, ew, fieldWriters));
+              MapWriter outputDoc = fillOutputDoc(currentDoc, leaves, fieldWriters);
+              if (outputDoc != null) {
+                writer.add(outputDoc);
+              }
             }
           } finally {
+            timerCtx.stop();
           }
           //log.debug("--- writer exchanging from {}", buffer);
+          timerCtx = writerWaitTimer.time();
           try {
             long startExchangeBuffers = System.nanoTime();
             buffers.exchangeBuffers();
@@ -430,6 +557,7 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
               log.debug("Waited for reader thread {}:", Long.toString(((endExchangeBuffers - startExchangeBuffers) / 1000000)));
             }
           } finally {
+            timerCtx.stop();
           }
           buffer = buffers.getOutputBuffer();
           //log.debug("--- writer got {}", buffer);
@@ -437,23 +565,203 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
         return true;
       });
     }
+    transferTempPartitionCaches();
   }
 
-  void fillOutDocs(MergeIterator mergeIterator,
-                   ExportBuffers.Buffer buffer) throws IOException {
-    transferBatchToBufferForOutput(mergeIterator, buffer);
+  /**
+   * This method transfers the newly built per-segment partitioning bitsets to the global cache,
+   * keyed by the current query.
+   */
+  private void transferTempPartitionCaches() {
+    if (tempPartitionCaches == null || partitionCaches == null) {
+      return;
+    }
+    tempPartitionCaches.forEach((cacheKey, partitionSet) -> {
+      SolrCache<String, FixedBitSet> perSegmentCache = partitionCaches.computeIfAbsent(cacheKey, k -> {
+        CaffeineCache<String, FixedBitSet> cache = new CaffeineCache<>();
+        cache.init(
+                Map.of(
+                        // 100 unique queries should be enough for anyone ;)
+                        SolrCache.SIZE_PARAM, "100",
+                        // evict entries after 600 sec
+                        SolrCache.MAX_IDLE_TIME_PARAM, "600"),
+                null, null);
+        return cache;
+      });
+      // use our unique query+numWorkers+worker key
+      perSegmentCache.put(partitionCacheKey, partitionSet);
+    });
   }
 
-  void writeDoc(SortDoc sortDoc,
-                List<LeafReaderContext> leaves,
-                EntryWriter ew, FieldWriter[] writers) throws IOException {
+  // this inits only those sets that are not already present in the global cache
+  // which were populated for these segments in previous runs
+  private void initTempPartitionCaches(List<LeafReaderContext> leaves) {
+    tempPartitionCaches.clear();
+    for (LeafReaderContext leaf : leaves) {
+      IndexReader.CacheHelper cacheHelper = leaf.reader().getReaderCacheHelper();
+      if (cacheHelper == null) {
+        continue;
+      }
+      IndexReader.CacheKey cacheKey = cacheHelper.getKey();
+      // check if a bitset was computed earlier for this segment and this query and can be skipped
+      SolrCache<String, FixedBitSet> perSegmentCache = partitionCaches.get(cacheKey);
+      if (perSegmentCache != null && perSegmentCache.get(partitionCacheKey) != null) {
+        // already computed earlier
+        continue;
+      }
+      tempPartitionCaches.put(cacheKey, new FixedBitSet(leaf.reader().maxDoc()));
+    }
+  }
+
+  void fillNextBuffer(MergeIterator mergeIterator,
+                      ExportBuffers.Buffer buffer) throws IOException {
+    Timer.Context timerCtx = fillOutputBufferTimer.time();
+    try {
+      int outDocsIndex = -1;
+      for (int i = 0; i < batchSize; i++) {
+        SortDoc sortDoc = mergeIterator.next();
+        if (sortDoc != null) {
+          buffer.outDocs[++outDocsIndex].setValues(sortDoc);
+        } else {
+          break;
+        }
+      }
+      buffer.outDocsIndex = outDocsIndex;
+    } catch (Throwable t) {
+      log.error("fillNextBuffer", t);
+      if (t instanceof InterruptedException) {
+        Thread.currentThread().interrupt();
+      }
+      throw t;
+    } finally {
+      timerCtx.stop();
+    }
+  }
+
+  // not sure about this class - it somewhat reduces object allocation as compared to LinkedHashMap
+  // NOTE: the lookup of values associated with partition keys uses an int lookup table that is
+  // indexed by the ord of the partition key in the list of partition keys.
+  private static final class OutputDocMapWriter implements MapWriter, EntryWriter {
+    final CharSequence[] keys;
+    final Object[] values;
+    final int[] partitionKeyToFieldIdx;
+    int pos;
+
+    OutputDocMapWriter(String[] fields, List<String> partitionKeys) {
+      keys = new CharSequence[fields.length];
+      values = new Object[fields.length];
+      if (partitionKeys != null) {
+        partitionKeyToFieldIdx = new int[partitionKeys.size()];
+OUTER:  for (int keyIdx = 0; keyIdx < partitionKeys.size(); keyIdx++) {
+          for (int fieldIdx = 0; fieldIdx < fields.length; fieldIdx++) {
+            if (fields[fieldIdx].equals(partitionKeys.get(keyIdx))) {
+              partitionKeyToFieldIdx[keyIdx] = fieldIdx;
+              continue OUTER;
+            }
+          }
+          partitionKeyToFieldIdx[keyIdx] = -1;
+        }
+      } else {
+        partitionKeyToFieldIdx = null;
+      }
+      pos = 0;
+    }
+
+    @Override
+    public EntryWriter put(CharSequence k, Object v) throws IOException {
+      keys[pos] = k;
+      values[pos] = v;
+      pos++;
+      return this;
+    }
+
+    public void clear() {
+      for (int i = 0; i < pos; i++) {
+        keys[i] = null;
+        values[i] = null;
+      }
+      pos = 0;
+    }
+
+    @Override
+    public void writeMap(EntryWriter ew) throws IOException {
+      for (int i = 0; i < pos; i++) {
+        ew.put(keys[i], values[i]);
+      }
+    }
+
+    /**
+     * Get the value associated with the partition key
+     * @param keyIdx index of the partition key in the list of keys
+     * @return associated value or null if missing
+     */
+    public Object get(int keyIdx) {
+      final int fieldIdx = partitionKeyToFieldIdx[keyIdx];
+      if (fieldIdx == -1) {
+        return null;
+      } else {
+        return values[fieldIdx];
+      }
+    }
+  }
+
+  // we materialize this document so that we can potentially do hash partitioning
+  private OutputDocMapWriter outputDoc;
+
+  // WARNING: single-thread only! shared var outputDoc
+  MapWriter fillOutputDoc(SortDoc sortDoc,
+                          List<LeafReaderContext> leaves,
+                          FieldWriter[] writers) throws IOException {
     int ord = sortDoc.ord;
     LeafReaderContext context = leaves.get(ord);
+    // reuse
+    outputDoc.clear();
     int fieldIndex = 0;
     for (FieldWriter fieldWriter : writers) {
-      if (fieldWriter.write(sortDoc, context, ew, fieldIndex)) {
+      if (fieldWriter.write(sortDoc, context, outputDoc, fieldIndex)) {
         ++fieldIndex;
       }
+    }
+    if (partitionKeys == null) {
+      return outputDoc;
+    } else {
+      // if we use partitioning then filter out unwanted docs
+      return partitionFilter(sortDoc, context, outputDoc);
+    }
+  }
+
+  MapWriter partitionFilter(SortDoc sortDoc, LeafReaderContext leaf, OutputDocMapWriter doc) {
+    FixedBitSet myPartitionSet = getMyPartitionSet(leaf);
+    if (myPartitionSet != null) {
+      // we already eliminated docs that don't belong to the partition
+      // and they are already marked in a cached set - so we already know this one
+      // belongs to our partition and we can skip the filtering
+      return doc;
+    }
+    // calculate hash
+    int hash = 0;
+    for (int keyIdx = 0; keyIdx < partitionKeys.size(); keyIdx++) {
+      Object value = doc.get(keyIdx);
+      if (value != null) {
+        hash += value.hashCode();
+      }
+    }
+    if ((hash & 0x7FFFFFFF) % numWorkers == workerId) {
+      // our partition
+      // check if we should mark it in the partitionSet
+      IndexReader.CacheHelper cacheHelper = leaf.reader().getReaderCacheHelper();
+      if (cacheHelper != null) {
+        IndexReader.CacheKey cacheKey = cacheHelper.getKey();
+        FixedBitSet partitionSet = tempPartitionCaches.get(cacheKey);
+        if (partitionSet != null) {
+          // not computed before - mark it
+          partitionSet.set(sortDoc.docId);
+        }
+      }
+      return doc;
+    } else {
+      // not our partition - skip it
+      return null;
     }
   }
 
@@ -682,7 +990,7 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
         int sortQueueSize = Math.min((int) (((double) maxDoc / (double) totalDocs) * this.priorityQueueSize), batchSize);
 
         //Protect against too small a queue size as well
-        if(sortQueueSize < 10) {
+        if (sortQueueSize < 10) {
           sortQueueSize = 10;
         }
 
@@ -702,12 +1010,39 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
       SegmentIterator[] segmentIterators = new SegmentIterator[leaves.size()];
       for (int i = 0; i < segmentIterators.length; i++) {
         SortQueue sortQueue = new SortQueue(sizes[i], sortDoc.copy());
-        segmentIterators[i] = new SegmentIterator(bits[i], leaves.get(i), sortQueue, sortDoc.copy());
+        segmentIterators[i] = new SegmentIterator(bits[i], leaves.get(i), sortQueue, sortDoc.copy(), segmentTopDocsTimer);
       }
 
       return new MergeIterator(segmentIterators, sortDoc);
     } finally {
     }
+  }
+
+  private FixedBitSet[] prepareMyPartitionSets(List<LeafReaderContext> leaves) {
+    FixedBitSet[] myPartitionSets = new FixedBitSet[leaves.size()];
+    for (int i = 0; i < leaves.size(); i++) {
+      LeafReaderContext leaf = leaves.get(i);
+      IndexReader.CacheHelper cacheHelper = leaf.reader().getReaderCacheHelper();
+      if (cacheHelper == null) {
+        // leave a null entry in the array
+        continue;
+      }
+      IndexReader.CacheKey cacheKey = cacheHelper.getKey();
+      SolrCache<String, FixedBitSet> perSegmentCaches = partitionCaches.get(cacheKey);
+      if (perSegmentCaches == null) {
+        // no queries yet for this segment - leave a null entry
+        continue;
+      }
+      myPartitionSets[i] = perSegmentCaches.get(partitionCacheKey);
+    }
+    return myPartitionSets;
+  }
+
+  private FixedBitSet getMyPartitionSet(LeafReaderContext leaf) {
+    if (partitionCaches == null) {
+      return null;
+    }
+    return myPartitionSets[leaf.ord];
   }
 
   private static class SegmentIterator {
@@ -717,18 +1052,28 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
     private final SortDoc sortDoc;
     private final LeafReaderContext context;
     private final SortDoc[] outDocs;
+    private final Timer segmentTopDocsTimer;
 
     private SortDoc nextDoc;
     private int index;
 
 
-    public SegmentIterator(FixedBitSet bits, LeafReaderContext context, SortQueue sortQueue, SortDoc sortDoc) throws IOException {
+    /**
+     * Construct per-segment iterator for matching docs.
+     * @param bits matching document id-s in the segment
+     * @param context segment context
+     * @param sortQueue sort queue
+     * @param sortDoc proto sort document
+     */
+    public SegmentIterator(FixedBitSet bits, LeafReaderContext context, SortQueue sortQueue, SortDoc sortDoc,
+                           Timer segmentTopDocsTimer) throws IOException {
       this.bits = bits;
       this.queue = sortQueue;
       this.sortDoc = sortDoc;
       this.nextDoc = sortDoc.copy();
       this.context = context;
       this.outDocs = new SortDoc[sortQueue.maxSize];
+      this.segmentTopDocsTimer = segmentTopDocsTimer;
       topDocs();
     }
 
@@ -760,6 +1105,12 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
     }
 
     private void topDocs() throws IOException {
+      // optimization
+      if (bits.cardinality() == 0) {
+        index = -1;
+        return;
+      }
+      Timer.Context timerCtx = segmentTopDocsTimer.time();
       try {
         queue.reset();
         SortDoc top = queue.top();
@@ -787,7 +1138,7 @@ public class ExportWriter implements SolrCore.RawWriter, Closeable {
         log.error("Segment Iterator Error:", e);
         throw new IOException(e);
       } finally {
-
+        timerCtx.stop();
       }
     }
   }
